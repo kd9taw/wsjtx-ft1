@@ -486,6 +486,7 @@ void CPlotter::DrawOverlay()                   //DrawOverlay()
   if(m_mode=="FT8") {
     bw=7*12000.0/1920.0;     //FT8
   }
+  if(m_mode=="FT1") bw=3*12000.0/429.0;        //FT1: 4-CPM h=1/2
   if(m_mode.startsWith("FST4")) {
     int h=int(pow(2.0,m_nSubMode));
     int nsps=800;
@@ -576,7 +577,7 @@ void CPlotter::DrawOverlay()                   //DrawOverlay()
   int yTxTop=12;
   int yRxBottom=yTxTop + 2*yh + 4;
   if(m_mode=="JT9" or m_mode=="JT65" or m_mode=="Q65" or m_mode=="FT8"
-     or m_mode=="FT4" or m_mode.startsWith("FST4")) {
+     or m_mode=="FT4" or m_mode=="FT1" or m_mode.startsWith("FST4")) {
 
     if(m_mode=="FST4" and !m_bSingleDecode) {
       x1=XfromFreq(m_nfa);
@@ -626,7 +627,7 @@ void CPlotter::DrawOverlay()                   //DrawOverlay()
   }
 
   if(m_mode=="JT9" or m_mode=="JT65" or m_mode.mid(0,4)=="WSPR" or m_mode=="Q65"
-     or m_mode=="FT8" or m_mode=="FT4" or m_mode.startsWith("FST4")) {
+     or m_mode=="FT8" or m_mode=="FT4" or m_mode=="FT1" or m_mode.startsWith("FST4")) {
     painter0.setPen(penRed);
     x1=XfromFreq(m_txFreq);
     x2=XfromFreq(m_txFreq+bw);
