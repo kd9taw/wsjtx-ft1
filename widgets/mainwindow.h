@@ -231,6 +231,7 @@ private slots:
   void on_actionJT9_triggered();
   void on_actionJT65_triggered();
   void on_actionJT4_triggered();
+  void on_actionFT1_triggered();
   void on_actionFT4_triggered();
   void on_actionFT8_triggered();
   void on_actionFST4_triggered();

@@ -127,6 +127,7 @@ option (WSJT_GENERATE_DOCS "Generate documentation files." ON)
 option (WSJT_RIG_NONE_CAN_SPLIT "Allow split operation with \"None\" as rig.")
 option (WSJT_TRACE_UDP "Debugging option that turns on UDP message protocol diagnostics.")
 option (WSJT_BUILD_UTILS "Build simulators and code demonstrators." ON)
+option (WSJT_TESTS_ONLY "Build only test/utility executables (skip GUI, Hamlib, Qt5)" OFF)
 option (WSJT_FOX_OTP "Enable Fox OTP Verification Messages." ON)
 CMAKE_DEPENDENT_OPTION (WSJT_QDEBUG_IN_RELEASE "Leave Qt debugging statements in Release configuration." OFF
   "NOT is_debug_build" OFF)
@@ -314,16 +315,24 @@ set_source_files_properties (
   lib/crc14.cpp
   PROPERTIES COMPILE_FLAGS -fpermissive)
 
+option (WSJT_SKIP_OMNIRIG "Skip OmniRig support (for cross-compilation)" OFF)
+
+if (WSJT_SKIP_OMNIRIG)
+  add_definitions (-DSKIP_OMNIRIG)
+endif ()
+
 if (WIN32)
   set (wsjt_CXXSRCS
     ${wsjt_CXXSRCS}
     killbyname.cpp
     )
 
-  set (wsjt_qt_CXXSRCS
-    ${wsjt_qt_CXXSRCS}
-    Transceiver/OmniRigTransceiver.cpp
-    )
+  if (NOT WSJT_SKIP_OMNIRIG)
+    set (wsjt_qt_CXXSRCS
+      ${wsjt_qt_CXXSRCS}
+      Transceiver/OmniRigTransceiver.cpp
+      )
+  endif ()
 endif (WIN32)
 
 set (wsjt_FSRCS
@@ -340,6 +349,7 @@ set (wsjt_FSRCS
   lib/jt65_decode.f90
   lib/jt65_mod.f90
   lib/ft8_decode.f90
+  lib/ft1_decode.f90
   lib/ft4_decode.f90
   lib/fst4_decode.f90
   lib/get_q3list.f90
@@ -376,6 +386,9 @@ set (wsjt_FSRCS
   lib/azdist.f90
   lib/ft8/baseline.f90
   lib/ft4/ft4_baseline.f90
+  lib/ft1/bcjr_cpm.f90
+  lib/ft1/ir_harq_combine.f90
+  lib/ft1/ldpc348_91.f90
   lib/blanker.f90
   lib/bpdecode40.f90
   lib/bpdecode128_90.f90
@@ -392,6 +405,7 @@ set (wsjt_FSRCS
   lib/chkmsg.f90
   lib/chkss2.f90
   lib/ft4/clockit.f90
+  lib/ft1/cpm_trellis.f90
   lib/ft8/compress.f90
   lib/coord.f90
   lib/db.f90
@@ -463,6 +477,9 @@ set (wsjt_FSRCS
   lib/ft4/ft4code.f90
   lib/ft4/genft4.f90
   lib/ft4/gen_ft4wave.f90
+  lib/ft1/genft1.f90
+  lib/ft1/gen_ft1wave.f90
+  lib/ft1/ft1_interleave.f90
   lib/ft8/gen_ft8wave.f90
   lib/ft8/genft8refsig.f90
   lib/genwspr.f90
@@ -493,6 +510,7 @@ set (wsjt_FSRCS
   lib/fst4/lorentzian_fading.f90
   lib/lpf1.f90
   lib/map65_mmdec.f90
+  lib/ft1/matched_filter_bank.f90
   lib/mixlpf.f90
   lib/makepings.f90
   lib/moondopjpl.f90
@@ -515,6 +533,7 @@ set (wsjt_FSRCS
   lib/ft4/ft4sim.f90
   lib/ft4/ft4sim_mult.f90
   lib/ft4/ft4_downsample.f90
+  lib/ft1/ft1_downsample.f90
   lib/77bit/my_hash.f90
   lib/wsprd/osdwspr.f90
   lib/ft8/osd174_91.f90
@@ -556,6 +575,7 @@ set (wsjt_FSRCS
   lib/subtract65.f90
   lib/ft8/subtractft8.f90
   lib/ft4/subtractft4.f90
+  lib/ft1/ft1_sync.f90
   lib/sun.f90
   lib/symspec.f90
   lib/symspec2.f90
@@ -573,6 +593,7 @@ set (wsjt_FSRCS
   lib/test_snr.f90
   lib/timf2.f90
   lib/tweak1.f90
+  lib/ft1/turbo_decode_ft1.f90
   lib/twkfreq.f90
   lib/ft8/twkfreq1.f90
   lib/twkfreq65.f90
@@ -843,7 +864,7 @@ set_source_files_properties (lib/filbig.f90 PROPERTIES COMPILE_FLAGS "-Wno-alias
 set_property (SOURCE ${all_C_and_CXXSRCS} APPEND_STRING PROPERTY COMPILE_FLAGS " -include wsjtx_config.h")
 set_property (SOURCE ${all_C_and_CXXSRCS} APPEND PROPERTY OBJECT_DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/wsjtx_config.h)
 
-if (WIN32)
+if (WIN32 AND NOT WSJT_SKIP_OMNIRIG)
   # generate the OmniRig COM interface source
   find_program (DUMPCPP dumpcpp)
   if (DUMPCPP-NOTFOUND)
@@ -860,7 +881,7 @@ if (WIN32)
   endif (NOT AXSERVER)
   string (REPLACE "\"" "" AXSERVER ${AXSERVER})
   file (TO_CMAKE_PATH ${AXSERVER} AXSERVERSRCS)
-endif ()
+endif (WIN32 AND NOT WSJT_SKIP_OMNIRIG)
 
 
 #
@@ -926,7 +947,12 @@ endif ()
 # Boost
 #
 if (WIN32)
-  set (Boost_USE_STATIC_LIBS OFF)
+  if (WSJT_SKIP_OMNIRIG)
+    # Cross-compilation: use static Boost libs
+    set (Boost_USE_STATIC_LIBS ON)
+  else ()
+    set (Boost_USE_STATIC_LIBS OFF)
+  endif ()
 endif ()
 find_package (Boost 1.62 REQUIRED COMPONENTS log_setup log)
 
@@ -940,32 +966,36 @@ find_package (OpenMP)
 #
 find_package (FFTW3 COMPONENTS single threads REQUIRED)
 
-#
-# hamlib setup
-#
-find_package (Hamlib REQUIRED)
-find_program (RIGCTL_EXE rigctl)
-find_program (RIGCTLD_EXE rigctld)
-find_program (RIGCTLCOM_EXE rigctlcom)
+if (NOT WSJT_TESTS_ONLY)
+  #
+  # hamlib setup
+  #
+  find_package (Hamlib REQUIRED)
+  find_program (RIGCTL_EXE rigctl)
+  find_program (RIGCTLD_EXE rigctld)
+  find_program (RIGCTLCOM_EXE rigctlcom)
 
-check_type_size (CACHE_ALL HAMLIB_OLD_CACHING)
-check_symbol_exists (rig_set_cache_timeout_ms "hamlib/rig.h" HAVE_HAMLIB_CACHING)
+  check_type_size (CACHE_ALL HAMLIB_OLD_CACHING)
+  check_symbol_exists (rig_set_cache_timeout_ms "hamlib/rig.h" HAVE_HAMLIB_CACHING)
 
-find_package (Usb REQUIRED)
-if (WSJT_FOX_OTP)
-  add_definitions (-DFOX_OTP)
-endif ()
-#
-# Qt5 setup
-#
+  find_package (Usb REQUIRED)
+  if (WSJT_FOX_OTP)
+    add_definitions (-DFOX_OTP)
+  endif ()
+  #
+  # Qt5 setup
+  #
 
-# Widgets finds its own dependencies.
-find_package (Qt5 COMPONENTS Widgets SerialPort Multimedia PrintSupport Sql LinguistTools REQUIRED)
+  # Widgets finds its own dependencies.
+  find_package (Qt5 COMPONENTS Widgets SerialPort Multimedia PrintSupport Sql LinguistTools REQUIRED)
 
-if (WIN32)
-  add_definitions (-DQT_NEEDS_QTMAIN)
-  find_package (Qt5AxContainer REQUIRED)
-endif (WIN32)
+  if (WIN32)
+    add_definitions (-DQT_NEEDS_QTMAIN)
+    if (NOT WSJT_SKIP_OMNIRIG)
+      find_package (Qt5AxContainer REQUIRED)
+    endif ()
+  endif (WIN32)
+endif (NOT WSJT_TESTS_ONLY)
 
 #
 # Library building setup
@@ -983,7 +1013,7 @@ set (CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 #
 set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra")
 
-set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror -Wall -Wextra -fexceptions -frtti")
+set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror -Wno-error=deprecated-declarations -Wall -Wextra -fexceptions -frtti")
 
 if (NOT APPLE)
   set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-pragmas")
@@ -1114,28 +1144,36 @@ if (NOT "${QT_LIBRARY_DIR}" STREQUAL "/lib" AND NOT "${QT_LIBRARY_DIR}" STREQUAL
   set (QT_NEED_RPATH TRUE)
 endif ()
 
-#
-# stuff only qmake can tell us
-#
-get_target_property (QMAKE_EXECUTABLE Qt5::qmake LOCATION)
-get_target_property (LCONVERT_EXECUTABLE Qt5::lconvert LOCATION)
-function (QUERY_QMAKE VAR RESULT)
-  exec_program (${QMAKE_EXECUTABLE} ARGS "-query ${VAR}" RETURN_VALUE return_code OUTPUT_VARIABLE output)
-  if (NOT return_code)
-    file (TO_CMAKE_PATH "${output}" output)
-    set (${RESULT} ${output} PARENT_SCOPE)
-  endif (NOT return_code)
-  message (STATUS "Asking qmake for ${RESULT} and got ${output}")
-endfunction (QUERY_QMAKE)
+if (NOT WSJT_TESTS_ONLY)
+  #
+  # stuff only qmake can tell us
+  #
+  get_target_property (QMAKE_EXECUTABLE Qt5::qmake LOCATION)
+  get_target_property (LCONVERT_EXECUTABLE Qt5::lconvert LOCATION)
+  function (QUERY_QMAKE VAR RESULT)
+    exec_program (${QMAKE_EXECUTABLE} ARGS "-query ${VAR}" RETURN_VALUE return_code OUTPUT_VARIABLE output)
+    if (NOT return_code)
+      file (TO_CMAKE_PATH "${output}" output)
+      set (${RESULT} ${output} PARENT_SCOPE)
+    endif (NOT return_code)
+    message (STATUS "Asking qmake for ${RESULT} and got ${output}")
+  endfunction (QUERY_QMAKE)
 
-query_qmake (QT_INSTALL_PLUGINS QT_PLUGINS_DIR)
-query_qmake (QT_INSTALL_TRANSLATIONS QT_TRANSLATIONS_DIR)
-query_qmake (QT_INSTALL_IMPORTS QT_IMPORTS_DIR)
-query_qmake (QT_HOST_DATA QT_DATA_DIR)
-set (QT_MKSPECS_DIR ${QT_DATA_DIR}/mkspecs)
+  query_qmake (QT_INSTALL_PLUGINS QT_PLUGINS_DIR)
+  query_qmake (QT_INSTALL_TRANSLATIONS QT_TRANSLATIONS_DIR)
+  query_qmake (QT_INSTALL_IMPORTS QT_IMPORTS_DIR)
+  query_qmake (QT_HOST_DATA QT_DATA_DIR)
+  set (QT_MKSPECS_DIR ${QT_DATA_DIR}/mkspecs)
+endif (NOT WSJT_TESTS_ONLY)
 
 # project definitions
-add_definitions (-DQT5 -DCMAKE_BUILD -DBIGSYM=1 -DBOOST_ALL_DYN_LINK)
+add_definitions (-DCMAKE_BUILD -DBIGSYM=1)
+if (NOT WSJT_TESTS_ONLY)
+  add_definitions (-DQT5)
+  if (NOT Boost_USE_STATIC_LIBS)
+    add_definitions (-DBOOST_ALL_DYN_LINK)
+  endif ()
+endif ()
 if (CMAKE_HOST_UNIX)
   add_definitions (-DUNIX)
 elseif (CMAKE_HOST_WIN32)
@@ -1151,9 +1189,11 @@ endif ()
 if (WSJT_GENERATE_DOCS)
   add_subdirectory (doc)
 endif (WSJT_GENERATE_DOCS)
-if (EXISTS ${CMAKE_SOURCE_DIR}/tests AND IS_DIRECTORY ${CMAKE_SOURCE_DIR}/tests)
-  add_subdirectory (tests)
-endif ()
+if (NOT WSJT_TESTS_ONLY)
+  if (EXISTS ${CMAKE_SOURCE_DIR}/tests AND IS_DIRECTORY ${CMAKE_SOURCE_DIR}/tests)
+    add_subdirectory (tests)
+  endif ()
+endif (NOT WSJT_TESTS_ONLY)
 
 # build a library of package functionality (without and optionally with OpenMP support)
 add_library (wsjt_cxx STATIC ${wsjt_CSRCS} ${wsjt_CXXSRCS})
@@ -1276,6 +1316,30 @@ target_link_libraries (sfrx wsjt_fort wsjt_cxx)
 add_executable (msk144sim lib/msk144sim.f90)
 target_link_libraries (msk144sim wsjt_fort wsjt_cxx)
 
+add_executable (ft1sim lib/ft1/ft1sim.f90)
+target_link_libraries (ft1sim wsjt_fort wsjt_cxx)
+
+add_executable (ft1_test lib/ft1/ft1_test.f90)
+target_link_libraries (ft1_test wsjt_fort wsjt_cxx)
+
+add_executable (ft1_harq_test lib/ft1/ft1_harq_test.f90)
+target_link_libraries (ft1_harq_test wsjt_fort wsjt_cxx)
+
+add_executable (ft1_fading_test lib/ft1/ft1_fading_test.f90)
+target_link_libraries (ft1_fading_test wsjt_fort wsjt_cxx)
+
+add_executable (ft1_harq_fading_test lib/ft1/ft1_harq_fading_test.f90 lib/ft1/ft1_demod_bcjr.f90)
+target_link_libraries (ft1_harq_fading_test wsjt_fort wsjt_cxx)
+
+add_executable (ft1_timing_test lib/ft1/ft1_timing_test.f90)
+target_link_libraries (ft1_timing_test wsjt_fort wsjt_cxx)
+
+add_executable (ft1_freq_tolerance_test lib/ft1/ft1_freq_tolerance_test.f90)
+target_link_libraries (ft1_freq_tolerance_test wsjt_fort wsjt_cxx)
+
+add_executable (ft1_freq_est_test lib/ft1/ft1_freq_est_test.f90)
+target_link_libraries (ft1_freq_est_test wsjt_fort wsjt_cxx)
+
 add_executable (ft4sim lib/ft4/ft4sim.f90)
 target_link_libraries (ft4sim wsjt_fort wsjt_cxx)
 
@@ -1297,6 +1361,8 @@ add_executable (ldpcsim240_74 lib/fst4/ldpcsim240_74.f90)
 target_link_libraries (ldpcsim240_74 wsjt_fort wsjt_cxx)
 
 endif(WSJT_BUILD_UTILS)
+
+if (NOT WSJT_TESTS_ONLY)
 
 add_executable (fmtave lib/fmtave.f90)
 
@@ -1436,9 +1502,9 @@ add_library (wsjt_qt STATIC ${wsjt_qt_CXXSRCS} ${wsjt_qt_GENUISRCS} ${GENAXSRCS}
 # set wsjtx_udp exports to static variants
 target_compile_definitions (wsjt_qt PUBLIC UDP_STATIC_DEFINE)
 target_link_libraries (wsjt_qt Hamlib::Hamlib Boost::log qcp Qt5::Widgets Qt5::Network Qt5::Sql)
-if (WIN32)
+if (WIN32 AND NOT WSJT_SKIP_OMNIRIG)
   target_link_libraries (wsjt_qt Qt5::AxContainer Qt5::AxBase)
-endif (WIN32)
+endif (WIN32 AND NOT WSJT_SKIP_OMNIRIG)
 
 # build a library of package Qt functionality used in Fortran utilities
 add_library (fort_qt STATIC ${fort_qt_CXXSRCS})
@@ -1497,11 +1563,13 @@ else (${OPENMP_FOUND} OR APPLE)
   target_link_libraries (jt9 wsjt_fort wsjt_cxx fort_qt)
 endif (${OPENMP_FOUND} OR APPLE)
 
-if (WIN32)
+if (WIN32 AND NOT WSJT_SKIP_OMNIRIG)
   find_package (Portaudio REQUIRED)
   add_subdirectory (map65)
 endif ()
+if (NOT WSJT_SKIP_OMNIRIG)
   add_subdirectory (qmap)
+endif ()
 
 # build the main application
 generate_version_info (wsjtx_VERSION_RESOURCES
@@ -1759,10 +1827,14 @@ add_custom_target (revisiontag
 # explicitly say that the wsjt_qt depends on custom target, this is
 # done indirectly so that the revisiontag target gets built exactly
 # once per build
-add_dependencies (wsjt_qt revisiontag)
-add_dependencies (jt9 revisiontag)
-add_dependencies (wsprd revisiontag)
+if (NOT WSJT_TESTS_ONLY)
+  add_dependencies (wsjt_qt revisiontag)
+  add_dependencies (jt9 revisiontag)
+  add_dependencies (wsprd revisiontag)
+endif (NOT WSJT_TESTS_ONLY)
 
+
+endif (NOT WSJT_TESTS_ONLY)
 
 #
 # versioning and configuration
@@ -1773,6 +1845,7 @@ configure_file (
   )
 
 
+if (NOT WSJT_TESTS_ONLY)
 if (NOT WIN32 AND NOT APPLE)
   # install a desktop file so wsjtx appears in the application start
   # menu with an icon
@@ -1809,6 +1882,7 @@ if (NOT is_debug_build)
   # any fixup is done
   add_subdirectory (bundle_fixup)
 endif ()
+endif (NOT WSJT_TESTS_ONLY)
 
 
 #

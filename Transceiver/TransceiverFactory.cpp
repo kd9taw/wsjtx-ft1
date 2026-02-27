@@ -7,7 +7,7 @@
 #include "HRDTransceiver.hpp"
 #include "EmulateSplitTransceiver.hpp"
 
-#if defined (WIN32)
+#if defined (WIN32) && !defined(SKIP_OMNIRIG)
 #include "OmniRigTransceiver.hpp"
 #endif
 
@@ -38,7 +38,7 @@ TransceiverFactory::TransceiverFactory ()
   DXLabSuiteCommanderTransceiver::register_transceivers (&logger_, &transceivers_, CommanderId);
   HRDTransceiver::register_transceivers (&logger_, &transceivers_, HRDId);
   
-#if defined (WIN32)
+#if defined (WIN32) && !defined(SKIP_OMNIRIG)
   // OmniRig is ActiveX/COM server so only on Windows
   OmniRigTransceiver::register_transceivers (&logger_, &transceivers_, OmniRigOneId, OmniRigTwoId);
 #endif
@@ -130,7 +130,7 @@ std::unique_ptr<Transceiver> TransceiverFactory::create (ParameterPack const& pa
       }
       break;
 
-#if defined (WIN32)
+#if defined (WIN32) && !defined(SKIP_OMNIRIG)
     case OmniRigOneId:
       {
         std::unique_ptr<TransceiverBase> basic_transceiver;

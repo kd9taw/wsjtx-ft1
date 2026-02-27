@@ -100,8 +100,6 @@ contains
       real df_try                           !Trial frequency offset
       real df_coarse_best                   !Best coarse frequency offset
       real t_samp_est                       !Sample time for twist
-      integer, parameter :: NFREQ_FINE=21   !Fine freq steps (±0.5 Hz at 0.05 Hz)
-      real sync_freq_fine(NFREQ_FINE)       !Fine sync metrics
 
 ! Frequency search variables
       integer :: ncheck_out                  !ncheck from turbo decode
@@ -153,6 +151,17 @@ contains
       integer :: ntype_probe, nharderror_probe
       real :: dmin_probe, df_probe_offset
       real :: llr_probe(174)
+
+! Top-K Phase 1 candidate selection for Phase 2 Viterbi
+      integer, parameter :: NTOP=3           !Number of Phase 1 peaks to try
+      integer :: itop_idx(3)                 !Indices of top Phase 1 peaks
+      real    :: df_top(3)                   !Coarse freq for each top peak
+      integer :: ibest_top(3)                !Best timing for each top peak
+      real    :: vit_metric_top(3)           !Best Viterbi metric for each peak
+      real    :: df_final_top(3)             !Final freq (P1+P2) for each peak
+      integer :: itop, jtop, ntop_found      !Loop indices
+      real    :: sync_copy(49)               !Copy for peak finding
+      real    :: vit_overall_best            !Best Viterbi metric across all peaks
 
       data first/.true./
       data     mcq/0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0/
@@ -407,76 +416,224 @@ contains
                   sync_freq(ifreq) = smax
                enddo
 
-               ifreq = maxloc(sync_freq, 1)
-! Parabolic interpolation for sub-step frequency accuracy
-               if(ifreq.gt.1 .and. ifreq.lt.NFREQ) then
-                  xq1 = sync_freq(ifreq-1)
-                  xq2 = sync_freq(ifreq)
-                  xq3 = sync_freq(ifreq+1)
-                  dxq = xq1 - 2.0*xq2 + xq3
-                  if(dxq.ne.0.0) then
-                     df_fine = 0.5*(xq1 - xq3)/dxq
-                  else
-                     df_fine = 0.0
-                  endif
-               else
-                  df_fine = 0.0
-               endif
-               df_coarse_best = (real(ifreq - 25) + df_fine) * 0.5
-               ibest = ibest_freq(ifreq)
-
-! Phase 2: Fine sync at 0.05 Hz steps around coarse best
-               sync_freq_fine = 0.0
-               do ifreq=1,NFREQ_FINE
-                  df_try = df_coarse_best + real(ifreq - 11) * 0.05
-                  do i=0,NDMAX-1
-                     t_samp_est = real(i) * dt_samp
-                     cb(i) = cd2(i) * &
-                          cmplx(cos(-twopi*df_try*t_samp_est), &
-                                sin(-twopi*df_try*t_samp_est))
+! Find top-NTOP Phase 1 peaks (separated by >=2 grid points = 1 Hz)
+               sync_copy = sync_freq
+               ntop_found = 0
+               do itop = 1, NTOP
+                  ifreq = maxloc(sync_copy, 1)
+                  if(sync_copy(ifreq) .le. -90.0) exit
+                  ntop_found = ntop_found + 1
+                  itop_idx(ntop_found) = ifreq
+                  ! Zero out this peak and neighbors to find next distinct peak
+                  do jtop = max(1,ifreq-2), min(NFREQ,ifreq+2)
+                     sync_copy(jtop) = -99.0
                   enddo
-                  call sync1d_ft1(cb,ibest,ctwk_dum,0,  &
-                       icos_rv(0:3,0),sync)
-                  sync_freq_fine(ifreq) = sync
                enddo
-               ifreq = maxloc(sync_freq_fine, 1)
-               if(ifreq.gt.1 .and. ifreq.lt.NFREQ_FINE) then
-                  xq1 = sync_freq_fine(ifreq-1)
-                  xq2 = sync_freq_fine(ifreq)
-                  xq3 = sync_freq_fine(ifreq+1)
-                  dxq = xq1 - 2.0*xq2 + xq3
-                  if(dxq.ne.0.0) then
-                     df_fine = 0.5*(xq1 - xq3)/dxq
-                  else
-                     df_fine = 0.0
-                  endif
-               else
-                  df_fine = 0.0
-               endif
-               df_coarse_best = df_coarse_best + &
-                    (real(ifreq - 11) + df_fine) * 0.05
 
-! Phase 3: Ultra-fine sync at 0.01 Hz steps (±0.05 Hz around Phase 2 best)
-               if(.false.) then  ! DISABLED for testing
-               do ifreq=1,11
-                  df_try = df_coarse_best + real(ifreq - 6) * 0.01
-                  do i=0,NDMAX-1
-                     t_samp_est = real(i) * dt_samp
-                     cb(i) = cd2(i) * &
-                          cmplx(cos(-twopi*df_try*t_samp_est), &
-                                sin(-twopi*df_try*t_samp_est))
-                  enddo
-                  call sync1d_ft1(cb,ibest,ctwk_dum,0,  &
-                       icos_rv(0:3,0),sync)
-                  sync_freq_fine(ifreq) = sync
+! Run Phase 2 Viterbi on each top-K Phase 1 candidate
+               vit_overall_best = -1.0e30
+               do itop = 1, ntop_found
+                  ifreq = itop_idx(itop)
+                  ! Parabolic interpolation for sub-step frequency accuracy
+                  if(ifreq.gt.1 .and. ifreq.lt.NFREQ) then
+                     xq1 = sync_freq(ifreq-1)
+                     xq2 = sync_freq(ifreq)
+                     xq3 = sync_freq(ifreq+1)
+                     dxq = xq1 - 2.0*xq2 + xq3
+                     if(dxq.ne.0.0) then
+                        df_fine = 0.5*(xq1 - xq3)/dxq
+                     else
+                        df_fine = 0.0
+                     endif
+                  else
+                     df_fine = 0.0
+                  endif
+                  df_top(itop) = (real(ifreq - 25) + df_fine) * 0.5
+                  ibest_top(itop) = ibest_freq(ifreq)
+
+! Phase 2: Viterbi frequency search using all 99 symbols
+! Matches turbo_decode's proven VitSweep pattern:
+!   1. Apply Phase 1's frequency correction to cd2 → cb
+!   2. Estimate G1 carrier phase ONCE on corrected signal
+!   3. Apply phase correction to cb
+!   4. Compute MF correlations on phase+freq corrected cb
+!   5. Viterbi sweep with frequency-ONLY rotation (no per-trial phase)
+
+! Set up sync symbol map (-1 = data, >=0 = known Costas tone)
+               sync_sym_map = -1
+               sync_sym_map(1:4)   = icos_rv(0:3, 0)
+               sync_sym_map(48:51) = icos_rv(0:3, 0)
+               sync_sym_map(96:99) = icos_rv(0:3, 0)
+
+! Apply Phase 1's frequency correction to cd2 → cb
+               df_coarse_best = df_top(itop)
+               ibest = ibest_top(itop)
+               do i=0,NDMAX-1
+                  t_samp_est = real(i) * dt_samp
+                  cb(i) = cd2(i) * cmplx( &
+                       cos(-twopi*df_coarse_best*t_samp_est), &
+                       sin(-twopi*df_coarse_best*t_samp_est))
                enddo
-               ifreq = maxloc(sync_freq_fine(1:11), 1)
-               if(ifreq.gt.1 .and. ifreq.lt.11) then
-                  xq1 = sync_freq_fine(ifreq-1)
-                  xq2 = sync_freq_fine(ifreq)
-                  xq3 = sync_freq_fine(ifreq+1)
+
+! Estimate G1 carrier phase ONCE on the corrected signal
+               phase_sum_g1 = cmplx(0.0, 0.0)
+               s_g1 = 1
+               do j_sync = 1, 4
+                  idx_vit = nint(real(j_sync - 1) * nsps_dn) + ibest
+                  corr_vit = cmplx(0.0, 0.0)
+                  do k_vit = 1, nss_ds
+                     n_samp = idx_vit + k_vit - 1
+                     if(n_samp.ge.0 .and. n_samp.le.NDMAX-1) then
+                        corr_vit = corr_vit + cb(n_samp) * &
+                             conjg(mf_bank(k_vit, s_g1, &
+                             sync_sym_map(j_sync)))
+                     endif
+                  enddo
+                  phase_sum_g1 = phase_sum_g1 + corr_vit
+                  s_g1 = next_state(s_g1, sync_sym_map(j_sync))
+               enddo
+               phi_g1 = atan2(aimag(phase_sum_g1), real(phase_sum_g1))
+
+! Apply phase correction to cb
+               do i=0,NDMAX-1
+                  cb(i) = cb(i) * cmplx(cos(-phi_g1), sin(-phi_g1))
+               enddo
+
+! Compute complex MF correlations on phase+freq corrected signal
+               do n_vit = 1, NN
+                  idx_vit = nint(real(n_vit - 1) * nsps_dn) + ibest
+                  do s_vit = 1, NSTATES
+                     do u_vit = 0, 3
+                        corr_vit = cmplx(0.0, 0.0)
+                        do k_vit = 1, nss_ds
+                           n_samp = idx_vit + k_vit - 1
+                           if(n_samp.ge.0 .and. n_samp.le.NDMAX-1) then
+                              corr_vit = corr_vit + cb(n_samp) * &
+                                   conjg(mf_bank(k_vit, s_vit, u_vit))
+                           endif
+                        enddo
+                        all_corr(s_vit, u_vit, n_vit) = corr_vit
+                     enddo
+                  enddo
+               enddo
+
+! Coarse Viterbi sweep: ±3 Hz at 0.1 Hz (61 points)
+! Frequency-only rotation — no per-trial phase estimation.
+               vit_best_metric = -1.0e30
+               idf_best = 31
+               do idf_s = 1, 61
+                  df_try = real(idf_s - 31) * 0.1
+
+                  alpha_vit = -1.0e30
+                  alpha_vit(1) = 0.0        ! Known start state
+                  do n_vit = 1, NN
+                     theta_rot = twopi*df_try*real(n_vit-1)/28.0
+                     vit_cos = cos(theta_rot)
+                     vit_sin = sin(theta_rot)
+                     alpha_vit_new = -1.0e30
+                     if(sync_sym_map(n_vit) .ge. 0) then
+                        u_vit = sync_sym_map(n_vit)
+                        do s_vit = 1, NSTATES
+                           if(alpha_vit(s_vit) .le. -1.0e20) cycle
+                           s_next_v = next_state(s_vit, u_vit)
+                           bm_vit = real(all_corr(s_vit,u_vit,n_vit)) &
+                                *vit_cos + aimag(all_corr(s_vit,u_vit, &
+                                n_vit))*vit_sin
+                           if(alpha_vit(s_vit)+bm_vit .gt. &
+                                alpha_vit_new(s_next_v)) then
+                              alpha_vit_new(s_next_v) = &
+                                   alpha_vit(s_vit)+bm_vit
+                           endif
+                        enddo
+                     else
+                        do s_vit = 1, NSTATES
+                           if(alpha_vit(s_vit) .le. -1.0e20) cycle
+                           do u_vit = 0, 3
+                              s_next_v = next_state(s_vit, u_vit)
+                              bm_vit = real(all_corr(s_vit,u_vit,n_vit)) &
+                                   *vit_cos + aimag(all_corr(s_vit,u_vit, &
+                                   n_vit))*vit_sin
+                              if(alpha_vit(s_vit)+bm_vit .gt. &
+                                   alpha_vit_new(s_next_v)) then
+                                 alpha_vit_new(s_next_v) = &
+                                      alpha_vit(s_vit)+bm_vit
+                              endif
+                           enddo
+                        enddo
+                     endif
+                     alpha_vit = alpha_vit_new
+                  enddo
+
+                  bm_vit = maxval(alpha_vit)
+                  if(bm_vit .gt. vit_best_metric) then
+                     vit_best_metric = bm_vit
+                     idf_best = idf_s
+                  endif
+               enddo
+               df_fine = real(idf_best - 31) * 0.1
+
+! Fine Viterbi sweep: ±0.2 Hz at 0.01 Hz (41 points)
+               df_center = df_fine
+               vit_best_metric = -1.0e30
+               idf_best = 21
+               do idf_s = 1, 41
+                  df_try = df_center + real(idf_s - 21) * 0.01
+
+                  alpha_vit = -1.0e30
+                  alpha_vit(1) = 0.0
+                  do n_vit = 1, NN
+                     theta_rot = twopi*df_try*real(n_vit-1)/28.0
+                     vit_cos = cos(theta_rot)
+                     vit_sin = sin(theta_rot)
+                     alpha_vit_new = -1.0e30
+                     if(sync_sym_map(n_vit) .ge. 0) then
+                        u_vit = sync_sym_map(n_vit)
+                        do s_vit = 1, NSTATES
+                           if(alpha_vit(s_vit) .le. -1.0e20) cycle
+                           s_next_v = next_state(s_vit, u_vit)
+                           bm_vit = real(all_corr(s_vit,u_vit,n_vit)) &
+                                *vit_cos + aimag(all_corr(s_vit,u_vit, &
+                                n_vit))*vit_sin
+                           if(alpha_vit(s_vit)+bm_vit .gt. &
+                                alpha_vit_new(s_next_v)) then
+                              alpha_vit_new(s_next_v) = &
+                                   alpha_vit(s_vit)+bm_vit
+                           endif
+                        enddo
+                     else
+                        do s_vit = 1, NSTATES
+                           if(alpha_vit(s_vit) .le. -1.0e20) cycle
+                           do u_vit = 0, 3
+                              s_next_v = next_state(s_vit, u_vit)
+                              bm_vit = real(all_corr(s_vit,u_vit,n_vit)) &
+                                   *vit_cos + aimag(all_corr(s_vit,u_vit, &
+                                   n_vit))*vit_sin
+                              if(alpha_vit(s_vit)+bm_vit .gt. &
+                                   alpha_vit_new(s_next_v)) then
+                                 alpha_vit_new(s_next_v) = &
+                                      alpha_vit(s_vit)+bm_vit
+                              endif
+                           enddo
+                        enddo
+                     endif
+                     alpha_vit = alpha_vit_new
+                  enddo
+
+                  bm_vit = maxval(alpha_vit)
+                  vit_metric(idf_s) = bm_vit
+                  if(bm_vit .gt. vit_best_metric) then
+                     vit_best_metric = bm_vit
+                     idf_best = idf_s
+                  endif
+               enddo
+
+! Parabolic interpolation on fine sweep for sub-step accuracy
+               if(idf_best.gt.1 .and. idf_best.lt.41) then
+                  xq1 = vit_metric(idf_best-1)
+                  xq2 = vit_metric(idf_best)
+                  xq3 = vit_metric(idf_best+1)
                   dxq = xq1 - 2.0*xq2 + xq3
-                  if(dxq.ne.0.0) then
+                  if(abs(dxq).gt.1.0e-10) then
                      df_fine = 0.5*(xq1 - xq3)/dxq
                   else
                      df_fine = 0.0
@@ -484,9 +641,23 @@ contains
                else
                   df_fine = 0.0
                endif
-               df_coarse_best = df_coarse_best + &
-                    (real(ifreq - 6) + df_fine) * 0.01
-               endif  ! Phase 3 disabled
+! Store Phase 1 + Phase 2 Viterbi result for this candidate
+               df_final_top(itop) = df_coarse_best + df_center + &
+                    (real(idf_best - 21) + df_fine) * 0.01
+               vit_metric_top(itop) = vit_best_metric
+               if(vit_best_metric .gt. vit_overall_best) then
+                  vit_overall_best = vit_best_metric
+               endif
+               enddo  ! itop (top-K Phase 1 candidates)
+
+! Select Phase 1 candidate with best Phase 2 Viterbi metric
+               do itop = 1, ntop_found
+                  if(vit_metric_top(itop) .ge. vit_overall_best) then
+                     df_coarse_best = df_final_top(itop)
+                     ibest = ibest_top(itop)
+                     exit
+                  endif
+               enddo
 
                call timer('sync1d  ',1)
 

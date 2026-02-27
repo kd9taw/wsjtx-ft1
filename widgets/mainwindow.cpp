@@ -115,6 +115,12 @@ extern "C" {
   void genft8_(char* msg, int* i3, int* n3, char* msgsent, char ft8msgbits[],
                int itone[], fortran_charlen_t, fortran_charlen_t);
 
+  void genft1_(char* msg, int* ichk, char* msgsent, char ft1msgbits[], int itone[],
+               fortran_charlen_t, fortran_charlen_t);
+
+  void gen_ft1wave_(int itone[], int* nsym, int* nsps_num, int* nsps_den,
+                    float* fsample, float* f0, float wave[], int* nwave);
+
   void genft4_(char* msg, int* ichk, char* msgsent, char ft4msgbits[], int itone[],
                fortran_charlen_t, fortran_charlen_t);
 
@@ -3774,6 +3780,10 @@ void MainWindow::decode()                                       //decode()
   if(m_mode=="FT8") dec_data.params.lft8apon = ui->actionEnable_AP_FT8->isVisible () &&
       ui->actionEnable_AP_FT8->isChecked ();
   if(m_mode=="FT8") dec_data.params.napwid=50;
+  if(m_mode=="FT1") {
+    dec_data.params.nmode=1;
+    m_BestCQpriority="";
+  }
   if(m_mode=="FT4") {
     dec_data.params.nmode=5;
     m_BestCQpriority="";
@@ -5248,7 +5258,7 @@ void MainWindow::guiUpdate()
       if(m_mode=="WSPR") genwspr_(message, msgsent, const_cast<int *> (itone),
                                     (FCL)22, (FCL)22);
       if(m_mode=="MSK144" or m_mode=="FT8" or m_mode=="FT4"
-         or m_mode=="FST4" or m_mode=="FST4W" || "Q65" == m_mode) {
+         or m_mode=="FT1" or m_mode=="FST4" or m_mode=="FST4W" || "Q65" == m_mode) {
         if(m_mode=="MSK144") {
           genmsk_128_90_(message, &ichk, msgsent, const_cast<int *> (itone),
                          &m_currentMessageType, (FCL)37, (FCL)37);
@@ -5298,6 +5308,20 @@ void MainWindow::guiUpdate()
               }
             }
           }
+        }
+        if(m_mode=="FT1") {
+          int ichk=0;
+          char ft1msgbits[77];
+          genft1_(message, &ichk, msgsent, const_cast<char *> (ft1msgbits),
+                  const_cast<int *>(itone), (FCL)37, (FCL)37);
+          int nsym=99;
+          int nsps_num=3000;
+          int nsps_den=7;
+          float fsample=48000.0;
+          float f0=ui->TxFreqSpinBox->value() - m_XIT;
+          int nwave=4*42429;  // 42429 samples at 12kHz, upsampled 4x to 48kHz
+          gen_ft1wave_(const_cast<int *>(itone),&nsym,&nsps_num,&nsps_den,
+                       &fsample,&f0,foxcom_.wave,&nwave);
         }
         if(m_mode=="FT4") {
           int ichk=0;
@@ -7572,6 +7596,54 @@ void MainWindow::on_actionFST4W_triggered()
   statusChanged();
 }
 
+void MainWindow::on_actionFT1_triggered()
+{
+  QTimer::singleShot (50, [=] {
+    ui->TxFreqSpinBox->setValue(m_settings->value("TxFreq_old",1500).toInt());
+    ui->RxFreqSpinBox->setValue(m_settings->value("RxFreq_old",1500).toInt());
+    on_sbSubmode_valueChanged(ui->sbSubmode->value());
+  });
+  m_mode="FT1";
+  m_TRperiod=4.0;
+  bool bVHF=m_config.enable_VHF_features();
+  m_bFast9=false;
+  m_bFastMode=false;
+  WSPR_config(false);
+  switch_mode (Modes::FT1);
+  m_nsps=858;                            // 2*429 for FFT (2 * nominal NSPS)
+  m_FFTSize = m_nsps/2;
+  Q_EMIT FFTSize (m_FFTSize);
+  m_hsymStop=21;
+  setup_status_bar (bVHF);
+  m_toneSpacing=12000.0/429.0;            // ~28 Hz tone spacing
+  ui->actionFT1->setChecked(true);
+  m_wideGraph->setMode(m_mode);
+  m_send_RR73=true;
+  VHF_features_enabled(bVHF);
+  ui->cbAutoSeq->setChecked(true);
+  m_fastGraph->hide();
+  m_wideGraph->show();
+  ui->rh_decodes_headings_label->setText("  UTC   dB   DT Freq    " + tr ("Message"));
+  m_wideGraph->setPeriod(m_TRperiod,m_nsps);
+  m_modulator->setTRPeriod(m_TRperiod);
+  m_detector->setTRPeriod(m_TRperiod);
+  ui->rh_decodes_title_label->setText(tr ("Rx Frequency"));
+  ui->lh_decodes_title_label->setText(tr ("Band Activity"));
+  ui->lh_decodes_headings_label->setText( "  UTC   dB   DT Freq    " + tr ("Message"));
+//                         01234567890123456789012345678901234567
+  displayWidgets(nWidgets("11101000010011100001000000011000100000"));
+  ui->txrb2->setEnabled(true);
+  ui->txrb4->setEnabled(true);
+  ui->txrb5->setEnabled(true);
+  ui->txrb6->setEnabled(true);
+  ui->txb2->setEnabled(true);
+  ui->txb4->setEnabled(true);
+  ui->txb5->setEnabled(true);
+  ui->txb6->setEnabled(true);
+  ui->txFirstCheckBox->setEnabled(true);
+  statusChanged();
+}
+
 void MainWindow::on_actionFT4_triggered()
 {
   QTimer::singleShot (50, [=] {
@@ -9015,6 +9087,17 @@ void MainWindow::transmit (double snr)
     toneSpacing=-2.0;                     //Transmit a pre-computed, filtered waveform.
     Q_EMIT sendMessage (m_mode, NUM_FT4_SYMBOLS,
            576.0, ui->TxFreqSpinBox->value() - m_XIT,
+           toneSpacing, m_soundOutput, m_config.audio_output_channel(),
+           true, false, snr, m_TRperiod);
+  }
+
+  if (m_mode == "FT1") {
+    m_dateTimeSentTx3=QDateTime::currentDateTimeUtc();
+    toneSpacing=-2.0;                     //Transmit a pre-computed, filtered waveform.
+    int nsym=99;
+    double nsps_eff=48000.0*3000.0/(7.0*12000.0);  // 1714.286 at 48kHz
+    Q_EMIT sendMessage (m_mode, nsym,
+           nsps_eff, ui->TxFreqSpinBox->value() - m_XIT,
            toneSpacing, m_soundOutput, m_config.audio_output_channel(),
            true, false, snr, m_TRperiod);
   }
