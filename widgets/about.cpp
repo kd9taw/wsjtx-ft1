@@ -22,6 +22,7 @@ CAboutDlg::CAboutDlg(QWidget *parent) :
     "&copy; 2001-2025 by Joe Taylor, K1JT, Bill Somerville, G4WJS, <br />"
     "Steve Franke, K9AN, Nico Palermo, IV3NWV, <br />"
     "Uwe Risse, DG2YCB, and Brian Moran, N9ADG <br /><br />"
+    "FT1 mode &copy; 2026 by Seth McCall, KD9TAW<br /><br />"
     "We gratefully acknowledge contributions from AC6SL, AE4JY,<br />"
     "DF2ET, DJ0OT, G3WDG, G4KLA, IW3RAB, K3WYC, KA1GT,<br />"
     "KA6MAL, KA9Q, KB1ZMX, KD6EKQ, KG4IYS, KI7MT, KK1D, ND0B,<br />"

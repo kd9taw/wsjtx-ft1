@@ -3141,7 +3141,8 @@ void MainWindow::on_actionCopyright_Notice_triggered()
                            "K1JT; Bill Somerville, G4WJS; Steven Franke, K9AN; Nico Palermo, "
                            "IV3NWV; Greg Beam, KI7MT; Michael Black, W9MDB; Edson Pereira, PY2SDR; "
                            "Philip Karn, KA9Q; Uwe Risse, DG2YCB; Brian Moran, N9ADG; "
-                           "and other members of the WSJT Development Group.\"");
+                           "and other members of the WSJT Development Group.\"\n\n"
+                           "\"The FT1 mode is Copyright (C) 2026 by Seth McCall, KD9TAW.\"");
   MessageBox::warning_message(this, message);
 }
 

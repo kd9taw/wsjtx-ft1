@@ -1,3 +1,21 @@
+! FT1 - 4-CPM turbo equalization mode for WSJT-X
+! Copyright (C) 2026 Seth McCall, KD9TAW
+!
+! This file is part of WSJT-X.
+!
+! WSJT-X is free software: you can redistribute it and/or modify
+! it under the terms of the GNU General Public License as published by
+! the Free Software Foundation, either version 3 of the License, or
+! (at your option) any later version.
+!
+! WSJT-X is distributed in the hope that it will be useful,
+! but WITHOUT ANY WARRANTY; without even the implied warranty of
+! MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+! GNU General Public License for more details.
+!
+! You should have received a copy of the GNU General Public License
+! along with WSJT-X. If not, see <https://www.gnu.org/licenses/>.
+!
 module timing_results
 ! Module-level storage for decode results (accessible from callback)
   implicit none
