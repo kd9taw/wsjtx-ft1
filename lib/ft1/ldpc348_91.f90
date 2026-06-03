@@ -569,4 +569,153 @@ contains
 
   end subroutine bpdecode_ext
 
+
+  subroutine bpdecode_ext_soft(llr_combined, ncombined, maxiterations, &
+       message77, zn_out, nharderror, ncheck_out, iter)
+  ! Soft-output sibling of bpdecode_ext: identical BP on the extended Tanner
+  ! graph, but also returns the per-bit a-posteriori belief zn_out(1:ncombined)
+  ! and the final unsatisfied-check count ncheck_out, so a joint-turbo HARQ
+  ! caller can form the LDPC extrinsic (zn_out - channel_llr) to feed back into
+  ! the per-frame BCJR. Supports ncombined = N_EXT1 (261) or N_EXT2 (348).
+    use crc
+    implicit none
+    integer, intent(in)  :: ncombined, maxiterations
+    real,    intent(in)  :: llr_combined(ncombined)
+    integer*1, intent(out) :: message77(77)
+    real,    intent(out) :: zn_out(ncombined)
+    integer, intent(out) :: nharderror, ncheck_out, iter
+
+    integer, parameter :: N=174, K=91, M=83
+    integer, parameter :: MAX_CHECKS = M_MOTHER
+    integer, parameter :: MAX_BITS   = N_MOTHER
+    integer, parameter :: MAX_COL_WT = 9
+    integer :: nrw(M), ncw
+    integer :: Nm(7,M), Mn(3,N)
+    integer :: nrw_ext(MAX_CHECKS), Nm_ext(7,MAX_CHECKS)
+    integer :: Mn_ext(MAX_COL_WT,MAX_BITS), ncw_ext(MAX_BITS)
+    real    :: zn(MAX_BITS), tov(MAX_COL_WT,MAX_BITS), toc(7,MAX_CHECKS)
+    real    :: tanhtoc(7,MAX_CHECKS)
+    integer*1 :: cw(MAX_BITS), decoded(K)
+    integer :: synd(MAX_CHECKS)
+    integer :: nrows, ncols
+    integer :: i, j, kk, ibj, ichk, ncheck, ncnt, nclast, nd, nbadcrc, nsum
+    real    :: Tmn, y
+
+    include "../ft8/ldpc_174_91_c_parity.f90"
+
+    call init_ldpc348_91()
+    nharderror = -1; message77 = 0; ncheck_out = 99; zn_out = 0.0
+
+    if(ncombined .eq. N_EXT1) then
+       nrows = M_EXT1; ncols = N_EXT1
+    else if(ncombined .eq. N_EXT2) then
+       nrows = M_EXT2; ncols = N_EXT2
+    else
+       return                     !only extended sizes supported
+    endif
+
+    ! Build extended Tanner graph (identical to bpdecode_ext)
+    Nm_ext = 0; Mn_ext = 0; ncw_ext = 0; nrw_ext = 0
+    do j = 1, M
+       nrw_ext(j) = nrw(j); Nm_ext(1:7,j) = Nm(1:7,j)
+    enddo
+    do i = 1, N
+       ncw_ext(i) = ncw; Mn_ext(1:3,i) = Mn(1:3,i)
+    enddo
+    if(ncols .ge. N_EXT1) then
+       do i = 1, N_NEW_PER_RV
+          j = M + i; nrw_ext(j) = ext1_nrw(i)
+          do kk = 1, ext1_nrw(i)
+             Nm_ext(kk,j) = ext1_cols(kk,i); ibj = ext1_cols(kk,i)
+             ncw_ext(ibj) = ncw_ext(ibj) + 1
+             if(ncw_ext(ibj) .le. MAX_COL_WT) Mn_ext(ncw_ext(ibj),ibj) = j
+          enddo
+       enddo
+    endif
+    if(ncols .ge. N_EXT2) then
+       do i = 1, N_NEW_PER_RV
+          j = M_EXT1 + i; nrw_ext(j) = ext2_nrw(i)
+          do kk = 1, ext2_nrw(i)
+             Nm_ext(kk,j) = ext2_cols(kk,i); ibj = ext2_cols(kk,i)
+             ncw_ext(ibj) = ncw_ext(ibj) + 1
+             if(ncw_ext(ibj) .le. MAX_COL_WT) Mn_ext(ncw_ext(ibj),ibj) = j
+          enddo
+       enddo
+    endif
+
+    toc = 0.0; tov = 0.0; tanhtoc = 0.0
+    do j = 1, nrows
+       do i = 1, nrw_ext(j)
+          ibj = Nm_ext(i,j)
+          if(ibj .ge. 1 .and. ibj .le. ncols) toc(i,j) = llr_combined(ibj)
+       enddo
+    enddo
+    ncnt = 0; nclast = 0
+
+    do iter = 0, maxiterations
+       do i = 1, ncols
+          zn(i) = llr_combined(i) + sum(tov(1:ncw_ext(i),i))
+       enddo
+       cw(1:ncols) = 0
+       where(zn(1:ncols) .gt. 0.0) cw(1:ncols) = 1
+       ncheck = 0
+       do i = 1, nrows
+          nsum = 0
+          do kk = 1, nrw_ext(i)
+             ibj = Nm_ext(kk,i)
+             if(ibj .ge. 1 .and. ibj .le. ncols) nsum = nsum + cw(ibj)
+          enddo
+          synd(i) = mod(nsum,2)
+          if(synd(i) .ne. 0) ncheck = ncheck + 1
+       enddo
+       ncheck_out = ncheck
+       zn_out(1:ncols) = zn(1:ncols)
+       if(ncheck .eq. 0) then
+          decoded = cw(1:K)
+          call chkcrc14a(decoded, nbadcrc)
+          nharderror = count((2*cw(1:ncols)-1)*llr_combined(1:ncols) .lt. 0.0)
+          if(nbadcrc .eq. 0) then
+             message77 = decoded(1:77)
+             return
+          endif
+       endif
+       if(iter .gt. 0) then
+          nd = ncheck - nclast
+          if(nd .lt. 0) then; ncnt = 0; else; ncnt = ncnt + 1; endif
+          if(ncnt .ge. 5 .and. iter .ge. 10 .and. ncheck .gt. 15) then
+             nharderror = -1
+             return
+          endif
+       endif
+       nclast = ncheck
+       do j = 1, nrows
+          do i = 1, nrw_ext(j)
+             ibj = Nm_ext(i,j)
+             if(ibj .lt. 1 .or. ibj .gt. ncols) cycle
+             toc(i,j) = zn(ibj)
+             do kk = 1, ncw_ext(ibj)
+                if(Mn_ext(kk,ibj) .eq. j) toc(i,j) = toc(i,j) - tov(kk,ibj)
+             enddo
+          enddo
+       enddo
+       do i = 1, nrows
+          do kk = 1, nrw_ext(i)
+             tanhtoc(kk,i) = tanh(-toc(kk,i)/2.0)
+          enddo
+       enddo
+       do j = 1, ncols
+          do i = 1, ncw_ext(j)
+             ichk = Mn_ext(i,j)
+             if(ichk .lt. 1 .or. ichk .gt. nrows) cycle
+             Tmn = product(tanhtoc(1:nrw_ext(ichk),ichk), &
+                  mask=Nm_ext(1:nrw_ext(ichk),ichk) .ne. j)
+             call platanh(-Tmn, y)
+             tov(i,j) = 2.0*y
+          enddo
+       enddo
+    enddo
+    nharderror = -1
+    return
+  end subroutine bpdecode_ext_soft
+
 end module ldpc348_91_mod

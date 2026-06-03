@@ -37,11 +37,13 @@ program ft1_harq_fading_test
 
   parameter (NDMAX=NMAX/NDOWN)
 
-  character*37 msg37, msgsent37
+  character*37 msg37, msgsent37, ms_chk
   character arg*12
   integer itone_rv0(NN), itone_rv1(NN), itone_rv2(NN)
+  integer itone_chk(NN)
+  integer nbad0, nbad1, nbad2
   integer itmp(ND)
-  integer*1 msgbits(77)
+  integer*1 msgbits(77), mb_chk(77)
   integer*1 message91(91)
   integer*1 cw174(174), cw348(N_MOTHER)
   integer*1 tx174_rv1(174), tx174_rv2(174)
@@ -58,6 +60,7 @@ program ft1_harq_fading_test
   real :: t_start, t_end, t_rv0, t_rv1, t_rv2
   real :: t_rv0_sum, t_rv1_sum, t_rv2_sum
   integer :: n_rv1_calls, n_rv2_calls
+  integer :: niter_joint
 
   real wave_rv0(NMAX), wave_rv1(NMAX), wave_rv2(NMAX)
   real llr_out(174), llr_rv0(174), llr_rv1(174), llr_rv2(174)
@@ -101,6 +104,11 @@ program ft1_harq_fading_test
   if(nargs .ge. 5) then
      call getarg(5, arg)
      read(arg, *) delay
+  endif
+  niter_joint = 0
+  if(nargs .ge. 6) then
+     call getarg(6, arg)
+     read(arg, *) niter_joint
   endif
 
   fs = 12000.0
@@ -149,6 +157,25 @@ program ft1_harq_fading_test
   itone_rv2(52:95) = itmp(44:87)
   itone_rv2(96:99) = icos_rv2
 
+  ! ===== WS-A2 validation =====================================================
+  ! The production encoder genft1_rv(...,irv) must reproduce, bit-for-bit, the
+  ! proven inline RV0/RV1/RV2 tone construction above. Verify before the sweep.
+  call genft1_rv(msg37, 0, 0, ms_chk, mb_chk, itone_chk)
+  nbad0 = count(itone_chk(1:NN) .ne. itone_rv0(1:NN))
+  call genft1_rv(msg37, 0, 1, ms_chk, mb_chk, itone_chk)
+  nbad1 = count(itone_chk(1:NN) .ne. itone_rv1(1:NN))
+  call genft1_rv(msg37, 0, 2, ms_chk, mb_chk, itone_chk)
+  nbad2 = count(itone_chk(1:NN) .ne. itone_rv2(1:NN))
+  write(*,'(a,i0,a,i0,a,i0)') 'genft1_rv vs inline tone mismatches:  RV0=', &
+       nbad0, '  RV1=', nbad1, '  RV2=', nbad2
+  if(nbad0 + nbad1 + nbad2 .ne. 0) then
+     write(*,'(a)') '*** FATAL: genft1_rv does not match the proven encoder ***'
+     stop 1
+  endif
+  write(*,'(a)') 'genft1_rv RV0/RV1/RV2 tone construction: VERIFIED'
+  write(*,*)
+  ! ===========================================================================
+
   ! Generate 3 CPM waveforms at 12 kHz
   nwave = NMAX
   wave_rv0 = 0.0
@@ -171,6 +198,12 @@ program ft1_harq_fading_test
   write(*,'(a,f6.2,a,f5.2,a)') 'Fading:       fspread=', fspread, &
        ' Hz, delay=', delay, ' ms'
   write(*,'(a,i4,a)') 'Trials:       ', ntrials, ' per SNR point'
+  if(niter_joint .ge. 1) then
+     write(*,'(a,i2,a)') 'HARQ combine: JOINT iterative turbo (', &
+          niter_joint, ' outer iters)'
+  else
+     write(*,'(a)') 'HARQ combine: incumbent single-BCJR + LDPC combine'
+  endif
   write(*,*)
 
   call sgran()
@@ -231,29 +264,35 @@ program ft1_harq_fading_test
              fspread, delay, sig, rms_orig, cd_rv1, NDMAX)
 
         call cpu_time(t_start)
-        call ft1_demod_bcjr(cd_rv1, NDMAX, snrdb, 1, llr_rv1)
+        if(niter_joint .ge. 1) then
+           ! Joint iterative turbo HARQ (RV0+RV1)
+           call ft1_joint_turbo_harq(cd_rv0, cd_rv1, cd_rv2, NDMAX, snrdb, &
+                2, decoded77, nharderror, niter_joint)
+        else
+           call ft1_demod_bcjr(cd_rv1, NDMAX, snrdb, 1, llr_rv1)
 
-        ! Combine: LDPC(261,91)
-        ! llr_rv1(1:87) = new parity LLRs, llr_rv1(88:174) = systematic repeat
-        llr_combined(1:174) = llr_rv0(1:174)
-        do i = 1, 87
-           llr_combined(i) = llr_combined(i) + llr_rv1(87 + i)
-        enddo
-        llr_combined(175:261) = llr_rv1(1:87)
-
-        call bpdecode_ext(llr_combined, N_EXT1, 50, decoded77, &
-             nharderror, iter)
-        ! OSD fallback on combined base-code LLRs
-        if(nharderror .lt. 0) then
-           apmask_osd = 0
-           do i_osd = 1, 4
-              call osd174_91(llr_combined, 91, apmask_osd, i_osd, &
-                   msg91_osd, cw_osd, nhd_osd, dmin_osd)
-              if(nhd_osd .ge. 0) then
-                 nharderror = nhd_osd
-                 exit
-              endif
+           ! Combine: LDPC(261,91)
+           ! llr_rv1(1:87) = new parity LLRs, llr_rv1(88:174) = systematic repeat
+           llr_combined(1:174) = llr_rv0(1:174)
+           do i = 1, 87
+              llr_combined(i) = llr_combined(i) + llr_rv1(87 + i)
            enddo
+           llr_combined(175:261) = llr_rv1(1:87)
+
+           call bpdecode_ext(llr_combined, N_EXT1, 50, decoded77, &
+                nharderror, iter)
+           ! OSD fallback on combined base-code LLRs
+           if(nharderror .lt. 0) then
+              apmask_osd = 0
+              do i_osd = 1, 4
+                 call osd174_91(llr_combined, 91, apmask_osd, i_osd, &
+                      msg91_osd, cw_osd, nhd_osd, dmin_osd)
+                 if(nhd_osd .ge. 0) then
+                    nharderror = nhd_osd
+                    exit
+                 endif
+              enddo
+           endif
         endif
         call cpu_time(t_end)
         t_rv1_sum = t_rv1_sum + (t_end - t_start) * 1000.0
@@ -269,27 +308,33 @@ program ft1_harq_fading_test
              fspread, delay, sig, rms_orig, cd_rv2, NDMAX)
 
         call cpu_time(t_start)
-        call ft1_demod_bcjr(cd_rv2, NDMAX, snrdb, 2, llr_rv2)
+        if(niter_joint .ge. 1) then
+           ! Joint iterative turbo HARQ (RV0+RV1+RV2)
+           call ft1_joint_turbo_harq(cd_rv0, cd_rv1, cd_rv2, NDMAX, snrdb, &
+                3, decoded77, nharderror, niter_joint)
+        else
+           call ft1_demod_bcjr(cd_rv2, NDMAX, snrdb, 2, llr_rv2)
 
-        ! Extend to LDPC(348,91)
-        do i = 1, 87
-           llr_combined(i) = llr_combined(i) + llr_rv2(87 + i)
-        enddo
-        llr_combined(262:348) = llr_rv2(1:87)
-
-        call bpdecode_ext(llr_combined, N_EXT2, 50, decoded77, &
-             nharderror, iter)
-        ! OSD fallback on combined base-code LLRs
-        if(nharderror .lt. 0) then
-           apmask_osd = 0
-           do i_osd = 1, 4
-              call osd174_91(llr_combined, 91, apmask_osd, i_osd, &
-                   msg91_osd, cw_osd, nhd_osd, dmin_osd)
-              if(nhd_osd .ge. 0) then
-                 nharderror = nhd_osd
-                 exit
-              endif
+           ! Extend to LDPC(348,91)
+           do i = 1, 87
+              llr_combined(i) = llr_combined(i) + llr_rv2(87 + i)
            enddo
+           llr_combined(262:348) = llr_rv2(1:87)
+
+           call bpdecode_ext(llr_combined, N_EXT2, 50, decoded77, &
+                nharderror, iter)
+           ! OSD fallback on combined base-code LLRs
+           if(nharderror .lt. 0) then
+              apmask_osd = 0
+              do i_osd = 1, 4
+                 call osd174_91(llr_combined, 91, apmask_osd, i_osd, &
+                      msg91_osd, cw_osd, nhd_osd, dmin_osd)
+                 if(nhd_osd .ge. 0) then
+                    nharderror = nhd_osd
+                    exit
+                 endif
+              enddo
+           endif
         endif
         call cpu_time(t_end)
         t_rv2_sum = t_rv2_sum + (t_end - t_start) * 1000.0

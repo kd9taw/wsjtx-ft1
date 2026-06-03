@@ -18,12 +18,15 @@
 !
 module ir_harq_combine_mod
 
-! IR-HARQ soft LLR combining for FT1.
+! IR-HARQ joint-turbo combining for FT1.
 !
-! Manages per-signal LLR buffers across T/R periods.
-! When a decode fails on RV0, the turbo-extracted LLRs are stored.
-! When RV1 or RV2 arrives at the same frequency, LLRs are combined
-! and decoded with the extended LDPC code.
+! Manages per-signal RAW BASEBAND buffers across T/R periods. When a decode
+! fails on RV0, the RV-aware-synced complex baseband (cd) of that frame is
+! stored. When RV1 (or RV2) arrives at the same frequency, the buffered RV
+! frames are combined by ft1_joint_turbo_harq (turbo_decode_ft1.f90), which
+! re-demodulates each frame's cd jointly with the combined LDPC(261/348) code
+! — recovering the coherent turbo gain the old single-BCJR LLR combine threw
+! away (+1.3 dB AWGN / +3.2 dB fading on the 3-TX threshold; see WS-A0).
 !
 ! Buffer key: (frequency_bin, T/R parity) with ±10 Hz matching tolerance.
 ! Expiry: 30 seconds (7-8 T/R periods at 4.0s).
@@ -37,17 +40,22 @@ module ir_harq_combine_mod
   integer, parameter :: MAX_HARQ_SLOTS = 100    !Max simultaneous in-progress decodes
   integer, parameter :: FREQ_TOL_HZ = 10        !Frequency matching tolerance (Hz)
   integer, parameter :: EXPIRY_MS = 30000        !Buffer expiry (30 seconds)
+  integer, parameter :: HARQ_NDMAX = 888         !Downsampled frame length (NMAX/NDOWN)
+  integer, parameter :: HARQ_NITER = 5           !Joint turbo outer iters (compute sweet spot)
 
   type :: harq_slot
      logical :: active = .false.
-     real :: freq = 0.0                          !Signal frequency (Hz)
+     real :: freq = 0.0                          !Signal frequency (Hz) of the RV0 frame
+     integer :: ibest = 0                        !RV0 frame timing (downsampled samples).
+                                                 !Anchors RV1/RV2 detection+sync: later RVs
+                                                 !of a QSO arrive at the same slot alignment.
      integer :: rv_count = -1                    !Highest RV stored (0, 1, or 2)
      integer :: timestamp_ms = 0                 !Timestamp of last update
-     real :: llr_rv0(174)                        !LLRs from RV0 turbo decode
-     real :: llr_rv1_new(87)                     !New parity LLRs from RV1
-     real :: llr_rv1_repeat(87)                  !Repeated systematic LLRs from RV1
-     real :: llr_rv2_new(87)                     !New parity LLRs from RV2
-     real :: llr_rv2_repeat(87)                  !Repeated systematic LLRs from RV2
+     real :: snr_est = -99.0                     !SNR (dB) used for joint demod
+     integer :: npts = HARQ_NDMAX                !Valid samples in the cd buffers
+     complex :: cd_rv0(HARQ_NDMAX)               !RV0 frame baseband (offset-0 aligned)
+     complex :: cd_rv1(HARQ_NDMAX)               !RV1 frame baseband
+     complex :: cd_rv2(HARQ_NDMAX)               !RV2 frame baseband
   end type harq_slot
 
   type(harq_slot) :: slots(MAX_HARQ_SLOTS)
@@ -66,15 +74,19 @@ contains
   end subroutine harq_init
 
 
-  subroutine harq_store_rv0(freq, llr174, timestamp_ms)
-  ! Store LLRs from a failed RV0 decode attempt.
-  ! Called after turbo_decode_ft1 returns ntype < 0.
+  subroutine harq_store_rv0(freq, cd, npts, snr_est, ibest, timestamp_ms)
+  ! Store the RV0 frame's complex baseband (offset-0 aligned) + its frequency and
+  ! timing (ibest), for later joint-turbo combining when RV1/RV2 arrive. The
+  ! stored (freq, ibest) anchor the RV-aware detection+sync of those later frames.
 
     implicit none
     real, intent(in) :: freq
-    real, intent(in) :: llr174(174)
+    integer, intent(in) :: npts
+    complex, intent(in) :: cd(npts)
+    real, intent(in) :: snr_est
+    integer, intent(in) :: ibest
     integer, intent(in) :: timestamp_ms
-    integer :: islot
+    integer :: islot, nc
 
     if(.not.harq_initialized) call harq_init()
 
@@ -85,34 +97,64 @@ contains
        if(islot .le. 0) return          !Buffer full
     endif
 
+    nc = min(npts, HARQ_NDMAX)
     slots(islot)%active = .true.
     slots(islot)%freq = freq
+    slots(islot)%ibest = ibest
     slots(islot)%rv_count = 0
     slots(islot)%timestamp_ms = timestamp_ms
-    slots(islot)%llr_rv0 = llr174
+    slots(islot)%snr_est = snr_est
+    slots(islot)%npts = nc
+    slots(islot)%cd_rv0 = (0.0, 0.0)
+    slots(islot)%cd_rv0(1:nc) = cd(1:nc)
 
   end subroutine harq_store_rv0
 
 
-  subroutine harq_combine_rv1(freq, llr174_rv1, timestamp_ms, &
+  subroutine harq_lookup(freq, timestamp_ms, islot, freq_out, ibest_out, rvcount_out)
+  ! Look up an active (unexpired) HARQ slot near `freq`. Returns its stored RV0
+  ! frequency and timing so the caller can re-reference an incoming RV1/RV2 frame
+  ! to the RV0 anchor before RV detection + joint combining. islot<=0 if none.
+
+    implicit none
+    real, intent(in)     :: freq
+    integer, intent(in)  :: timestamp_ms
+    integer, intent(out) :: islot, ibest_out, rvcount_out
+    real, intent(out)    :: freq_out
+
+    freq_out = 0.0; ibest_out = 0; rvcount_out = -1
+    if(.not.harq_initialized) then
+       islot = 0
+       return
+    endif
+    islot = find_slot(freq, timestamp_ms)
+    if(islot .gt. 0) then
+       freq_out    = slots(islot)%freq
+       ibest_out   = slots(islot)%ibest
+       rvcount_out = slots(islot)%rv_count
+    endif
+
+  end subroutine harq_lookup
+
+
+  subroutine harq_combine_rv1(freq, cd, npts, snr_est, timestamp_ms, &
        message77, nharderror, decode_ok)
-  ! Combine RV0 + RV1 LLRs and attempt decode with LDPC(261,91).
-  !
-  ! RV1 transmitted bits: 87 new parity + 87 repeated systematic
-  ! Combined vector (261 elements):
-  !   Bits 1-174:   llr_rv0 + chase component from RV1 repeated bits
-  !   Bits 175-261: new parity LLRs from RV1
+  ! Buffer the RV1 frame's baseband and joint-turbo-combine it with the stored
+  ! RV0 frame (LDPC(261,91)) via ft1_joint_turbo_harq.
 
     implicit none
     real, intent(in) :: freq
-    real, intent(in) :: llr174_rv1(174)
+    integer, intent(in) :: npts
+    complex, intent(in) :: cd(npts)
+    real, intent(in) :: snr_est
     integer, intent(in) :: timestamp_ms
     integer*1, intent(out) :: message77(77)
     integer, intent(out) :: nharderror
     logical, intent(out) :: decode_ok
 
-    real :: llr_combined(N_EXT1)         !261 combined LLRs
-    integer :: islot, iter, i
+    complex :: cd_dummy(HARQ_NDMAX)
+    integer :: islot, nc, np
+    real :: snr_use
 
     decode_ok = .false.
     nharderror = -1
@@ -124,27 +166,19 @@ contains
     if(islot .le. 0) return             !No stored RV0 for this frequency
     if(slots(islot)%rv_count .lt. 0) return
 
-    ! Combine LLRs
-    ! First 174 bits: add RV0 LLRs + chase combining from repeated systematic
-    llr_combined(1:174) = slots(islot)%llr_rv0(1:174)
-
-    ! RV1 transmitted: bits 1-87 = new parity, bits 88-174 = systematic repeat
-    ! Add repeated systematic LLRs to positions 1-87 of combined vector
-    do i = 1, 87
-       llr_combined(i) = llr_combined(i) + llr174_rv1(87 + i)
-    enddo
-
-    ! New parity LLRs go to positions 175-261
-    llr_combined(175:261) = llr174_rv1(1:87)
-
-    ! Store RV1 components for potential RV2 combining
-    slots(islot)%llr_rv1_new = llr174_rv1(1:87)
-    slots(islot)%llr_rv1_repeat = llr174_rv1(88:174)
+    nc = min(npts, HARQ_NDMAX)
+    slots(islot)%cd_rv1 = (0.0, 0.0)
+    slots(islot)%cd_rv1(1:nc) = cd(1:nc)
     slots(islot)%rv_count = 1
     slots(islot)%timestamp_ms = timestamp_ms
 
-    ! Decode with extended LDPC(261,91)
-    call bpdecode_ext(llr_combined, N_EXT1, 50, message77, nharderror, iter)
+    ! Joint iterative turbo HARQ: RV0 + RV1 (re-demod each frame's cd jointly).
+    ! Use the more conservative (lower) SNR of the two frames for noise variance.
+    snr_use = min(slots(islot)%snr_est, snr_est)
+    np = min(slots(islot)%npts, nc)
+    cd_dummy = (0.0, 0.0)
+    call ft1_joint_turbo_harq(slots(islot)%cd_rv0, slots(islot)%cd_rv1, &
+         cd_dummy, np, snr_use, 2, message77, nharderror, HARQ_NITER)
 
     if(nharderror .ge. 0) then
        decode_ok = .true.
@@ -154,25 +188,23 @@ contains
   end subroutine harq_combine_rv1
 
 
-  subroutine harq_combine_rv2(freq, llr174_rv2, timestamp_ms, &
+  subroutine harq_combine_rv2(freq, cd, npts, snr_est, timestamp_ms, &
        message77, nharderror, decode_ok)
-  ! Combine RV0 + RV1 + RV2 LLRs and attempt decode with LDPC(348,91).
-  !
-  ! Full 348-bit combined vector:
-  !   Bits 1-174:   llr_rv0 + RV1 repeat + RV2 repeat
-  !   Bits 175-261: RV1 new parity
-  !   Bits 262-348: RV2 new parity
+  ! Buffer the RV2 frame's baseband and joint-turbo-combine RV0+RV1+RV2
+  ! (LDPC(348,91)) via ft1_joint_turbo_harq.
 
     implicit none
     real, intent(in) :: freq
-    real, intent(in) :: llr174_rv2(174)
+    integer, intent(in) :: npts
+    complex, intent(in) :: cd(npts)
+    real, intent(in) :: snr_est
     integer, intent(in) :: timestamp_ms
     integer*1, intent(out) :: message77(77)
     integer, intent(out) :: nharderror
     logical, intent(out) :: decode_ok
 
-    real :: llr_combined(N_EXT2)         !348 combined LLRs
-    integer :: islot, iter, i
+    integer :: islot, nc, np
+    real :: snr_use
 
     decode_ok = .false.
     nharderror = -1
@@ -184,38 +216,19 @@ contains
     if(islot .le. 0) return
     if(slots(islot)%rv_count .lt. 1) return   !Need at least RV0+RV1 stored
 
-    ! Build 348-element combined vector
-    ! Start with RV0 + RV1 chase contributions on first 174 bits
-    llr_combined(1:174) = slots(islot)%llr_rv0(1:174)
-
-    ! Add RV1 repeated systematic (positions 1-87)
-    do i = 1, 87
-       llr_combined(i) = llr_combined(i) + slots(islot)%llr_rv1_repeat(i)
-    enddo
-
-    ! Add RV2 repeated systematic (positions 1-87)
-    do i = 1, 87
-       llr_combined(i) = llr_combined(i) + llr174_rv2(87 + i)
-    enddo
-
-    ! RV1 new parity -> positions 175-261
-    llr_combined(175:261) = slots(islot)%llr_rv1_new(1:87)
-
-    ! RV2 new parity -> positions 262-348
-    llr_combined(262:348) = llr174_rv2(1:87)
-
-    ! Store RV2 and update slot
-    slots(islot)%llr_rv2_new = llr174_rv2(1:87)
-    slots(islot)%llr_rv2_repeat = llr174_rv2(88:174)
+    nc = min(npts, HARQ_NDMAX)
+    slots(islot)%cd_rv2 = (0.0, 0.0)
+    slots(islot)%cd_rv2(1:nc) = cd(1:nc)
     slots(islot)%rv_count = 2
     slots(islot)%timestamp_ms = timestamp_ms
 
-    ! Decode with full mother code LDPC(348,91)
-    call bpdecode_ext(llr_combined, N_EXT2, 50, message77, nharderror, iter)
+    ! Joint iterative turbo HARQ: RV0 + RV1 + RV2.
+    snr_use = min(slots(islot)%snr_est, snr_est)
+    np = min(slots(islot)%npts, nc)
+    call ft1_joint_turbo_harq(slots(islot)%cd_rv0, slots(islot)%cd_rv1, &
+         slots(islot)%cd_rv2, np, snr_use, 3, message77, nharderror, HARQ_NITER)
 
-    if(nharderror .ge. 0) then
-       decode_ok = .true.
-    endif
+    if(nharderror .ge. 0) decode_ok = .true.
 
     ! Always clear slot after RV2 (final attempt)
     call harq_clear_slot(islot)
@@ -309,12 +322,13 @@ contains
     slots(islot)%active = .false.
     slots(islot)%rv_count = -1
     slots(islot)%freq = 0.0
+    slots(islot)%ibest = 0
     slots(islot)%timestamp_ms = 0
-    slots(islot)%llr_rv0 = 0.0
-    slots(islot)%llr_rv1_new = 0.0
-    slots(islot)%llr_rv1_repeat = 0.0
-    slots(islot)%llr_rv2_new = 0.0
-    slots(islot)%llr_rv2_repeat = 0.0
+    slots(islot)%snr_est = -99.0
+    slots(islot)%npts = HARQ_NDMAX
+    slots(islot)%cd_rv0 = (0.0, 0.0)
+    slots(islot)%cd_rv1 = (0.0, 0.0)
+    slots(islot)%cd_rv2 = (0.0, 0.0)
   end subroutine harq_clear_slot
 
 end module ir_harq_combine_mod

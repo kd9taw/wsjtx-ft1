@@ -594,6 +594,7 @@ set (wsjt_FSRCS
   lib/timf2.f90
   lib/tweak1.f90
   lib/ft1/turbo_decode_ft1.f90
+  lib/ft1/ft1_rv_detect.f90
   lib/twkfreq.f90
   lib/ft8/twkfreq1.f90
   lib/twkfreq65.f90
@@ -1339,6 +1340,9 @@ target_link_libraries (ft1_freq_tolerance_test wsjt_fort wsjt_cxx)
 
 add_executable (ft1_freq_est_test lib/ft1/ft1_freq_est_test.f90)
 target_link_libraries (ft1_freq_est_test wsjt_fort wsjt_cxx)
+
+add_executable (ft1_rv_detect_test lib/ft1/ft1_rv_detect_test.f90 lib/ft1/ft1_demod_bcjr.f90)
+target_link_libraries (ft1_rv_detect_test wsjt_fort wsjt_cxx)
 
 add_executable (ft4sim lib/ft4/ft4sim.f90)
 target_link_libraries (ft4sim wsjt_fort wsjt_cxx)

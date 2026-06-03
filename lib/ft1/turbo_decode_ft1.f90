@@ -371,6 +371,14 @@ subroutine turbo_decode_ft1(cd, npts, f0, dt0, snr_est, llr_out, &
 ! search to resolve ambiguity and estimate df from the phase slope
 ! across the full 3.5-second frame.
 
+! DISABLED (kept for reference, never compiled — the `.false.` short-circuits the
+! whole block, including its debug write). The 3-group phase-slope df estimate
+! proved unreliable: the pi/2-ambiguity 16-combo search over only G2/G3 is too
+! noisy at low SNR. Step 1c below (line ~471, also gated on niter_max==0) runs a
+! coarse Viterbi frequency sweep (±2 Hz @ 0.05 Hz) that is the robust replacement
+! Tempo's live decoder actually uses (ft1_cabi calls turbo with niter_max=0). Do
+! NOT re-enable without re-running the AWGN-threshold conformance sweep — it would
+! double-correct against that sweep and regress sensitivity.
   if(.false. .and. niter_max .eq. 0) then   ! DISABLED: phase-slope unreliable
   pi_val = 4.0 * atan(1.0)
 
@@ -882,7 +890,12 @@ subroutine turbo_decode_ft1(cd, npts, f0, dt0, snr_est, llr_out, &
      !   for fading and remaining frequency drift.
      ! ----------------------------------------------------------
      if(.false. .and. niter_max .eq. 0 .and. k_outer .eq. 2) then
-        ! DISABLED: phase-slope unreliable at k=2 (hard decisions too noisy)
+        ! DISABLED (kept for reference, never compiled): residual-df from
+        ! hard-decided per-symbol phase at k_outer==2 is too noisy (hard
+        ! decisions unreliable that early), and it would also reset the AP LLRs
+        ! mid-turbo, perturbing convergence. Step 1c's Viterbi sweep already
+        ! handles residual frequency. Do NOT re-enable without re-validating the
+        ! AWGN threshold — see the note at the Step 1b2 block above.
         ! Per-symbol residual phase from cd_rot correlations.
         ! Use BCJR-decided symbols to fix the input at each position,
         ! then search only over states. This avoids the (state,symbol)
@@ -1146,6 +1159,210 @@ subroutine turbo_decode_ft1(cd, npts, f0, dt0, snr_est, llr_out, &
   nharderror = -1
   return
 end subroutine turbo_decode_ft1
+
+
+subroutine ft1_joint_turbo_harq(cd_rv0, cd_rv1, cd_rv2, npts, snr_est, &
+     nrv, message77, nharderror, niter_outer)
+! Joint iterative turbo HARQ combining.
+!
+! The incumbent HARQ path gives RV0 full turbo (BCJR<->LDPC) but RV1/RV2 only a
+! single BCJR pass (ft1_demod_bcjr), then combines at the LDPC level — throwing
+! away ~1.5-2.5 dB of coherent turbo gain on every retransmitted frame. This
+! routine instead alternates a soft decode of the COMBINED LDPC(261/348) code
+! with a BCJR re-demod of EACH received RV frame, feeding combined-code
+! extrinsics back into every frame's a-priori (with own-look exclusion on the
+! repeated systematic bits, to avoid positive feedback). Phase estimation is
+! paid once per frame via ft1_bm_prep; only the cheap BCJR sweep repeats.
+!
+! Falls back to OSD + a full combined BP on the last iteration's channel
+! evidence, so it cannot do worse than the incumbent single-BCJR combine.
+!
+! Inputs:
+!   cd_rv0/1/2(npts) - complex baseband for each received RV frame
+!                      (cd_rv2 unused/ignored when nrv<3; pass it anyway)
+!   snr_est          - SNR estimate (dB, 2500 Hz BW)
+!   nrv              - number of RV frames available (2 or 3)
+!   niter_outer      - outer turbo iterations (5 typical; <=0 => no decode)
+! Outputs:
+!   message77(77)    - decoded message bits on success
+!   nharderror       - >=0 on success, -1 on failure
+  use cpm_trellis_mod
+  use ldpc348_91_mod
+  implicit none
+  integer, intent(in)    :: npts, nrv, niter_outer
+  complex, intent(in)    :: cd_rv0(npts), cd_rv1(npts), cd_rv2(npts)
+  real,    intent(in)    :: snr_est
+  integer*1, intent(out) :: message77(77)
+  integer, intent(out)   :: nharderror
+
+  integer, parameter :: NB = 174
+  real    :: bm0(NSTATES,0:3,99), bm1(NSTATES,0:3,99), bm2(NSTATES,0:3,99)
+  integer :: is_data(99), data_idx(99)
+  real    :: apri0(NB), apri1(NB), apri2(NB)              ! symbol order
+  real    :: extsym(NB), extcb0(NB), extcb1(NB), extcb2(NB) ! code-bit order
+  real    :: LCH(N_MOTHER), LE(N_MOTHER), zncomb(N_MOTHER)
+  real    :: aprcb(NB)
+  integer*1 :: msg77(77)
+  integer :: ncomb, t, nbp, nhd, ncheck, iter_bp, i
+  real    :: damp
+  ! OSD fallback
+  integer*1 :: apmask_osd(NB), cw_osd(NB), msg91_osd(91)
+  integer :: nhd_osd, i_osd
+  real    :: dmin_osd, llr_osd(NB)
+
+  nharderror = -1; message77 = 0
+  if(niter_outer .le. 0) return
+
+  if(nrv .ge. 3) then
+     ncomb = N_EXT2
+  else if(nrv .eq. 2) then
+     ncomb = N_EXT1
+  else
+     ncomb = N_BASE
+  endif
+
+  ! Phase est + branch-metric prep ONCE per available frame
+  call ft1_bm_prep(cd_rv0, npts, snr_est, 0, bm0, is_data, data_idx)
+  if(nrv .ge. 2) call ft1_bm_prep(cd_rv1, npts, snr_est, 1, bm1, is_data, data_idx)
+  if(nrv .ge. 3) call ft1_bm_prep(cd_rv2, npts, snr_est, 2, bm2, is_data, data_idx)
+
+  apri0 = 0.0; apri1 = 0.0; apri2 = 0.0
+  extcb0 = 0.0; extcb1 = 0.0; extcb2 = 0.0
+  LE = 0.0
+
+  do t = 1, niter_outer
+
+     ! 1+2. BCJR re-demod each frame, deinterleave to code-bit order
+     call bcjr_cpm(bm0, apri0, extsym, 99, 87, is_data, data_idx)
+     call ft1_interleave_real(extsym, extcb0, -1)
+     if(nrv .ge. 2) then
+        call bcjr_cpm(bm1, apri1, extsym, 99, 87, is_data, data_idx)
+        call ft1_interleave_real(extsym, extcb1, -1)
+     endif
+     if(nrv .ge. 3) then
+        call bcjr_cpm(bm2, apri2, extsym, 99, 87, is_data, data_idx)
+        call ft1_interleave_real(extsym, extcb2, -1)
+     endif
+
+     ! 3. Assemble combined channel LLR (matches incumbent combine layout)
+     LCH = 0.0
+     LCH(1:174) = extcb0(1:174)
+     if(nrv .ge. 2) then
+        do i = 1, 87
+           LCH(i) = LCH(i) + extcb1(87+i)      ! systematic repeat
+        enddo
+        LCH(175:261) = extcb1(1:87)            ! RV1 new parity
+     endif
+     if(nrv .ge. 3) then
+        do i = 1, 87
+           LCH(i) = LCH(i) + extcb2(87+i)
+        enddo
+        LCH(262:348) = extcb2(1:87)            ! RV2 new parity
+     endif
+
+     ! 4. Soft LDPC BP on the combined codeword (ramp iterations)
+     if(t .le. 2) then
+        nbp = 12
+     else if(t .le. 4) then
+        nbp = 25
+     else
+        nbp = 40
+     endif
+     call bpdecode_ext_soft(LCH(1:ncomb), ncomb, nbp, msg77, &
+          zncomb(1:ncomb), nhd, ncheck, iter_bp)
+
+     ! 5. CRC / convergence stop
+     if(ncheck .eq. 0 .and. nhd .ge. 0) then
+        message77 = msg77
+        nharderror = nhd
+        return
+     endif
+
+     ! 6. Combined LDPC extrinsic
+     do i = 1, ncomb
+        LE(i) = zncomb(i) - LCH(i)
+        if(LE(i) .gt. 30.0) LE(i) = 30.0
+        if(LE(i) .lt. -30.0) LE(i) = -30.0
+     enddo
+
+     ! Ramped damping
+     if(t .le. 2) then
+        damp = 0.3
+     else if(t .le. 4) then
+        damp = 0.5
+     else
+        damp = 0.7
+     endif
+
+     ! 7+8. Map LDPC extrinsic back to each frame (own-look excluded on
+     !      shared systematic bits 1-87), interleave to symbol order, damp.
+     aprcb = 0.0
+     aprcb(88:174) = LE(88:174)               ! RV0 exclusive parity
+     do i = 1, 87
+        aprcb(i) = LE(i)                       ! shared: code belief + others' looks
+        if(nrv .ge. 2) aprcb(i) = aprcb(i) + extcb1(87+i)
+        if(nrv .ge. 3) aprcb(i) = aprcb(i) + extcb2(87+i)
+     enddo
+     call clip30(aprcb, NB)
+     call ft1_interleave_real(aprcb, apri0, 1)
+     apri0 = damp * apri0
+
+     if(nrv .ge. 2) then
+        aprcb = 0.0
+        aprcb(1:87) = LE(175:261)             ! RV1 exclusive parity
+        do i = 1, 87
+           aprcb(87+i) = LE(i) + extcb0(i)    ! shared: + RV0 look
+           if(nrv .ge. 3) aprcb(87+i) = aprcb(87+i) + extcb2(87+i)
+        enddo
+        call clip30(aprcb, NB)
+        call ft1_interleave_real(aprcb, apri1, 1)
+        apri1 = damp * apri1
+     endif
+
+     if(nrv .ge. 3) then
+        aprcb = 0.0
+        aprcb(1:87) = LE(262:348)             ! RV2 exclusive parity
+        do i = 1, 87
+           aprcb(87+i) = LE(i) + extcb0(i) + extcb1(87+i)
+        enddo
+        call clip30(aprcb, NB)
+        call ft1_interleave_real(aprcb, apri2, 1)
+        apri2 = damp * apri2
+     endif
+
+  enddo  ! outer turbo loop
+
+  ! Fallback: OSD on the final combined base-code LLRs, then one full BP.
+  llr_osd(1:174) = LCH(1:174)
+  apmask_osd = 0
+  do i_osd = 1, 4
+     call osd174_91(llr_osd, 91, apmask_osd, i_osd, msg91_osd, cw_osd, &
+          nhd_osd, dmin_osd)
+     if(nhd_osd .ge. 0) then
+        message77 = msg91_osd(1:77)
+        nharderror = nhd_osd
+        return
+     endif
+  enddo
+  call bpdecode_ext_soft(LCH(1:ncomb), ncomb, 50, msg77, &
+       zncomb(1:ncomb), nhd, ncheck, iter_bp)
+  if(ncheck .eq. 0 .and. nhd .ge. 0) then
+     message77 = msg77
+     nharderror = nhd
+  endif
+  return
+
+contains
+  subroutine clip30(a, n)
+    integer, intent(in) :: n
+    real, intent(inout) :: a(n)
+    integer :: ii
+    do ii = 1, n
+       if(a(ii) .gt. 30.0) a(ii) = 30.0
+       if(a(ii) .lt. -30.0) a(ii) = -30.0
+    enddo
+  end subroutine clip30
+end subroutine ft1_joint_turbo_harq
 
 
 subroutine compute_branch_metrics_all(cd, npts, nss, sigma2, &

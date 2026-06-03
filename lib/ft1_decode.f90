@@ -20,6 +20,11 @@ module ft1_decode
 
    type :: ft1_decoder
       procedure(ft1_decode_callback), pointer :: callback
+      integer :: cur_rv = -1         ! RV (0/1/2) of the decode currently reported,
+                                     ! read by the callback (the abstract interface
+                                     ! is unchanged, so other implementers are unaffected)
+      integer :: frame_time_ms = 0   ! wall-clock ms of this frame, for cross-frame
+                                     ! IR-HARQ slot keying/expiry (set before decode())
    contains
       procedure :: decode
    end type ft1_decoder
@@ -76,6 +81,7 @@ contains
 
       complex cd2(0:NDMAX-1)                  !Complex downsampled waveform
       complex cb(0:NDMAX-1)                   !Working copy after freq correction
+      complex cd_harq(0:NDMAX-1)              !RV-aware-synced baseband for IR-HARQ buffering
       complex ctwk_dum(4*NSS)                   !Dummy for sync1d interface
       complex z_coh_g1,z_coh_g2,z_coh_g3      !Coherent sync group correlations
       complex z_coh_try,corr_coh               !Working vars for coherent freq est
@@ -110,6 +116,8 @@ contains
       logical harq_ok
       integer*1 harq_msg77(77)
       integer harq_nerr, itime_ms
+      integer harq_islot, harq_sibest, harq_srvc, irv_det
+      real harq_sfreq
 
 ! Frequency search variables
       integer, parameter :: NFREQ=49        !Number of coarse freq trials (±12 Hz at 0.5 Hz)
@@ -356,7 +364,11 @@ contains
          do icand=1,ncand
             f0=candidate(1,icand)
             snr0=candidate(2,icand)-1.0
-            irv=nint(candidate(3,icand))     !RV index (0,1,2)
+            irv=nint(candidate(3,icand))     !RV index hint (0,1,2) from sync
+            this%cur_rv=0                    !Reported RV = #RVs combined; standalone/AP
+                                             !report 0, HARQ combine overrides to 1/2 below.
+                                             !(Independent of the sync RV hint, which is
+                                             !an unvalidated spectrogram discriminator.)
 ! ================================================================
 ! Step 2a: Downsample to ~8 samples/symbol
 ! ================================================================
@@ -868,49 +880,55 @@ contains
 ! RV2 arrived: combine with stored RV0+RV1, decode LDPC(348,91)
 ! ================================================================
                if(nharderror.lt.0) then
-                  itime_ms=nint(1000.0*ibest/fs)  !Approximate timestamp
+                  itime_ms=this%frame_time_ms     !Wall-clock ms for cross-frame HARQ keying
 
-                  if(irv.eq.0) then
-! Store RV0 LLRs for future IR-HARQ combining
-                     call harq_store_rv0(f1,llr_out,itime_ms)
+! IR-HARQ with reliable RV-aware combining. The ft1_sync spectrogram RV tag is
+! NOT trusted. RV0 is decoded standalone (above); a failed frame is either a
+! fresh RV0 (no prior slot at this freq) or a retransmission. For a retransmission
+! we re-reference the frame to the stored RV0 slot's reliable freq + timing
+! (RV0/RV1/RV2 of a QSO arrive at the same slot alignment), classify the RV
+! coherently (ft1_rv_detect), and joint-turbo-combine on a valid RV progression.
+                  call harq_lookup(f1,itime_ms,harq_islot,harq_sfreq, &
+                       harq_sibest,harq_srvc)
 
-                  else if(irv.eq.1) then
-! Try combining RV0+RV1
-                     call harq_combine_rv1(f1,llr_out,itime_ms,  &
-                          harq_msg77,harq_nerr,harq_ok)
-                     if(harq_ok) then
-                        message77=harq_msg77
-                        nharderror=harq_nerr
-                        iaptype=0
-                        write(c77,'(77i1)') message77(1:77)
-                        call unpack77(c77,1,message,unpk77_success)
-                        if(unpk77_success) then
-                           if(dosubtract) then
-                              call get_ft1_tones_from_77bits(message77,i4tone)
-                              xdt=real(ibest)/fs
-                              call subtractft1(dd,i4tone,f1,xdt)
-                           endif
-                           idupe=0
-                           do i=1,ndecodes
-                              if(decodes(i).eq.message) idupe=1
-                           enddo
-                           if(idupe.eq.0) then
-                              ndecodes=ndecodes+1
-                              decodes(ndecodes)=message
-                              nsnr=nint(snr_est)
-                              xdt=ibest/fs - 0.5
-                              qual=1.0-(nharderror+dmin)/60.0
-                              call this%callback(smax,nsnr,xdt,f1,message, &
-                                   iaptype,qual)
-                           endif
-                           cycle
-                        endif
+                  if(harq_islot.le.0) then
+! No prior slot here: treat as a fresh RV0. Align the RV0-synced baseband (cb)
+! to symbol 0 by its own ibest and store it, with (f1,ibest) as the anchor.
+                     cd_harq=(0.0,0.0)
+                     do i=0,NDMAX-1
+                        if(i+ibest.le.NDMAX-1) cd_harq(i)=cb(i+ibest)
+                     enddo
+                     call harq_store_rv0(f1,cd_harq,NDMAX,snr_est,ibest,itime_ms)
+
+                  else
+! Retransmission candidate: re-reference at the slot's reliable freq + timing,
+! then classify the RV coherently.
+                     call ft1_downsample(dd,.true.,harq_sfreq,cd2)
+                     sum2=sum(real(cd2*conjg(cd2)))/real(NDMAX)
+                     if(sum2.gt.0.0) cd2=cd2/sqrt(sum2)
+                     cd_harq=(0.0,0.0)
+                     do i=0,NDMAX-1
+                        if(i+harq_sibest.ge.0 .and. i+harq_sibest.le.NDMAX-1) &
+                             cd_harq(i)=cd2(i+harq_sibest)
+                     enddo
+                     call ft1_rv_detect(cd_harq,NDMAX,0,irv_det)
+
+                     harq_ok=.false.
+                     if(irv_det.eq.0) then
+! Looks like a fresh RV0 (partner restarted) -> refresh the slot.
+                        call harq_store_rv0(harq_sfreq,cd_harq,NDMAX,snr_est, &
+                             harq_sibest,itime_ms)
+                     else if(irv_det.eq.1 .and. harq_srvc.eq.0) then
+                        call harq_combine_rv1(harq_sfreq,cd_harq,NDMAX,snr_est, &
+                             itime_ms,harq_msg77,harq_nerr,harq_ok)
+                        if(harq_ok) this%cur_rv=1
+                     else if(irv_det.eq.2 .and. harq_srvc.ge.1) then
+                        call harq_combine_rv2(harq_sfreq,cd_harq,NDMAX,snr_est, &
+                             itime_ms,harq_msg77,harq_nerr,harq_ok)
+                        if(harq_ok) this%cur_rv=2
                      endif
+! (other irv_det/rv_count combinations are progression mismatches -> ignored)
 
-                  else if(irv.eq.2) then
-! Try combining RV0+RV1+RV2
-                     call harq_combine_rv2(f1,llr_out,itime_ms,  &
-                          harq_msg77,harq_nerr,harq_ok)
                      if(harq_ok) then
                         message77=harq_msg77
                         nharderror=harq_nerr
@@ -918,11 +936,6 @@ contains
                         write(c77,'(77i1)') message77(1:77)
                         call unpack77(c77,1,message,unpk77_success)
                         if(unpk77_success) then
-                           if(dosubtract) then
-                              call get_ft1_tones_from_77bits(message77,i4tone)
-                              xdt=real(ibest)/fs
-                              call subtractft1(dd,i4tone,f1,xdt)
-                           endif
                            idupe=0
                            do i=1,ndecodes
                               if(decodes(i).eq.message) idupe=1
@@ -931,9 +944,9 @@ contains
                               ndecodes=ndecodes+1
                               decodes(ndecodes)=message
                               nsnr=nint(snr_est)
-                              xdt=ibest/fs - 0.5
+                              xdt=real(harq_sibest)/fs - 0.5
                               qual=1.0-(nharderror+dmin)/60.0
-                              call this%callback(smax,nsnr,xdt,f1,message, &
+                              call this%callback(smax,nsnr,xdt,harq_sfreq,message, &
                                    iaptype,qual)
                            endif
                            cycle
@@ -944,8 +957,8 @@ contains
 
          enddo                                !Candidate list
 
-! Expire stale IR-HARQ buffers at end of each subtraction pass
-         call harq_expire(nint(1000.0*real(NMAX)/12000.0))
+! Expire stale IR-HARQ buffers (older than EXPIRY_MS vs this frame's wall clock)
+         call harq_expire(this%frame_time_ms)
 
       enddo                                   !Subtraction passes
 
